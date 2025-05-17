@@ -1,6 +1,6 @@
 # Secure Jetson Nano 🚀🔒
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Release](https://img.shields.io/github/v/release/yourusername/secure-jetson-nano)](https://github.com/yourusername/secure-jetson-nano/releases) [![CI](https://img.shields.io/github/actions/workflow/status/yourusername/secure-jetson-nano/ci.yml)](https://github.com/yourusername/secure-jetson-nano/actions)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) 
 
 A drop-in **Bash** utility to generate a fully **hardened Jetson Nano SD card image**, featuring secure SSH, firewall protection, automatic updates, and OS-level hardening—all automated for first-boot.
 
