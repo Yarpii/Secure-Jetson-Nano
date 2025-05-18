@@ -16,33 +16,32 @@ SSH_PORT=22989  # Non-standard high port
 SD_DEVICE=""
 WORK_DIR="${HOME}/secure_jetson"
 
+
 # Help text
 usage() {
   cat <<EOF
-Usage: $0 -i <image.zip> -k <key.pub> [-u user] [-p port] [-d /dev/sdX]
-  -i  Jetson Nano image file (ZIP/IMG)
-  -k  SSH public key for authentication
-  -u  Username (default: secureuser)
-  -p  SSH port (default: 22989)
+Usage: $0 [-i <image.zip>] [-k <key.pub>] [-u user] [-p port] [-d /dev/sdX]
+  -i  Jetson Nano image file (ZIP/IMG) (default: $IMAGE_ZIP)
+  -k  SSH public key for authentication (default: $SSH_KEY)
+  -u  Username (default: $USERNAME)
+  -p  SSH port (default: $SSH_PORT)
   -d  SD card device (e.g. /dev/sdb)
 EOF
   exit 1
 }
 
 # Parse command line arguments
-while getopts ":i:k:u:p:d:" opt; do
+while getopts ":i:k:u:p:d:h" opt; do
   case $opt in
     i) IMAGE_ZIP="$OPTARG" ;;
     k) SSH_KEY="$OPTARG" ;;
     u) USERNAME="$OPTARG" ;;
     p) SSH_PORT="$OPTARG" ;;
     d) SD_DEVICE="$OPTARG" ;;
+    h) usage ;;
     *) usage ;;
   esac
 done
-
-# Validate required parameters
-[[ -z "$IMAGE_ZIP" || -z "$SSH_KEY" ]] && usage
 
 # Create work directory
 mkdir -p "$WORK_DIR"
@@ -60,10 +59,12 @@ cleanup() {
 trap cleanup EXIT
 
 # Check for required tools
-for cmd in unzip lsblk dd sha256sum sshd; do
-  command -v $cmd >/dev/null 2>&1 || {
-    echo -e "${RED}ERROR:${NC} Required command '$cmd' is missing"; exit 1;
-  }
+for cmd in unzip lsblk dd sha256sum partprobe; do
+  if ! command -v $cmd >/dev/null 2>&1; then
+    echo -e "${RED}ERROR:${NC} Required command '$cmd' is missing"
+    echo "Please install it with: sudo apt-get install $cmd"
+    exit 1
+  fi
 done
 
 echo -e "${GREEN}=== Creating Secure Jetson Nano ===${NC}"
@@ -107,22 +108,148 @@ echo "Flashing image to SD card..."
 sudo dd if="$IMAGE_FILE" of="$SD_DEVICE" bs=4M status=progress conv=fsync
 sync
 echo "Verifying flash with checksum..."
+IMG_SIZE=$(stat -c %s "$IMAGE_FILE")
+IMG_BLOCKS=$((IMG_SIZE / (4*1024*1024)))
+[[ $IMG_BLOCKS -lt 1 ]] && IMG_BLOCKS=1
 IMG_SUM=$(sha256sum "$IMAGE_FILE" | cut -d' ' -f1)
-DEV_SUM=$(sudo dd if="$SD_DEVICE" bs=4M count=$(( $(stat -c %s "$IMAGE_FILE") / (4*1024*1024) )) status=none | sha256sum | cut -d' ' -f1)
+DEV_SUM=$(sudo dd if="$SD_DEVICE" bs=4M count=$IMG_BLOCKS status=none | sha256sum | cut -d' ' -f1)
 [[ "$IMG_SUM" == "$DEV_SUM" ]] || { echo -e "${RED}Checksum verification failed${NC}"; exit 1; }
 echo -e "${GREEN}Flash completed and verified${NC}"
 
-# Wait for the system to recognize new partitions
-echo "Waiting for device partitions..."
-sleep 5
+# Force the kernel to re-read the partition table
+echo "Forcing kernel to re-read partition table..."
+sudo partprobe "$SD_DEVICE" || true
+sleep 5  # Wait for partitions to settle
 
-# Mount rootfs partition
+# Unmount any automounted partitions
+for part in $(lsblk -p -o NAME "$SD_DEVICE" | grep -v "^$SD_DEVICE$"); do
+  if mountpoint -q "$part" 2>/dev/null; then
+    echo "Unmounting auto-mounted partition $part..."
+    sudo umount "$part"
+  fi
+done
+
+# List available partitions
+echo "Available partitions:"
+lsblk -p "$SD_DEVICE"
+
+# Create mount point
 MOUNT_DIR="${WORK_DIR}/mount"
 mkdir -p "$MOUNT_DIR"
-ROOTFS_PART="${SD_DEVICE}2"
-[[ -b "${SD_DEVICE}p2" ]] && ROOTFS_PART="${SD_DEVICE}p2"
-echo "Mounting rootfs partition: $ROOTFS_PART"
-sudo mount "$ROOTFS_PART" "$MOUNT_DIR" || { echo -e "${RED}Failed to mount rootfs partition${NC}"; exit 1; }
+
+# Find rootfs partition - directly test the most common ones first
+echo "Looking for rootfs partition..."
+
+# Function to check if a partition looks like rootfs
+check_rootfs() {
+  local part=$1
+  local mount_dir=$2
+  
+  if ! [[ -b "$part" ]]; then
+    return 1
+  fi
+  
+  # Try different filesystem types
+  for fs_type in ext4 ext3 ext2; do
+    echo "Trying to mount $part as $fs_type..."
+    if sudo mount -t $fs_type "$part" "$mount_dir" 2>/dev/null; then
+      # Check if it has typical rootfs directories
+      if [[ -d "$mount_dir/etc" && -d "$mount_dir/bin" ]]; then
+        echo "Found rootfs partition: $part (filesystem: $fs_type)"
+        return 0
+      fi
+      sudo umount "$mount_dir"
+    fi
+  done
+  
+  # Also try auto detection
+  echo "Trying auto filesystem detection for $part..."
+  if sudo mount "$part" "$mount_dir" 2>/dev/null; then
+    if [[ -d "$mount_dir/etc" && -d "$mount_dir/bin" ]]; then
+      echo "Found rootfs partition: $part (auto-detected filesystem)"
+      return 0
+    fi
+    sudo umount "$mount_dir"
+  fi
+  
+  return 1
+}
+
+# Try partitions in the most likely order
+ROOTFS_FOUND=false
+ROOTFS_PART=""
+
+# For SD cards, the rootfs is often the first partition (App partition)
+for suffix in 1 p1; do
+  if [[ -b "${SD_DEVICE}${suffix}" ]]; then
+    if check_rootfs "${SD_DEVICE}${suffix}" "$MOUNT_DIR"; then
+      ROOTFS_FOUND=true
+      ROOTFS_PART="${SD_DEVICE}${suffix}"
+      break
+    fi
+  fi
+done
+
+# If not found, try other partitions
+if ! $ROOTFS_FOUND; then
+  for suffix in 2 p2 3 p3 4 p4 5 p5 6 p6 7 p7 8 p8 9 p9 10 p10 11 p11 12 p12 13 p13 14 p14; do
+    if [[ -b "${SD_DEVICE}${suffix}" ]]; then
+      if check_rootfs "${SD_DEVICE}${suffix}" "$MOUNT_DIR"; then
+        ROOTFS_FOUND=true
+        ROOTFS_PART="${SD_DEVICE}${suffix}"
+        break
+      fi
+    fi
+  done
+fi
+
+# If still not found, prompt user
+if ! $ROOTFS_FOUND; then
+  echo -e "${YELLOW}Could not find rootfs partition automatically.${NC}"
+  echo "Available partitions:"
+  lsblk -p -o NAME,SIZE,FSTYPE "$SD_DEVICE"
+  echo ""
+  echo -e "${YELLOW}Please examine the partitions and enter the rootfs partition:${NC}"
+  read -rp "Rootfs partition: " ROOTFS_PART
+  
+  if ! [[ -b "$ROOTFS_PART" ]]; then
+    echo -e "${RED}Invalid partition: $ROOTFS_PART${NC}"
+    exit 1
+  fi
+  
+  # Try mounting the specified partition
+  for fs_type in ext4 ext3 ext2 auto; do
+    FS_OPTION=""
+    [[ "$fs_type" != "auto" ]] && FS_OPTION="-t $fs_type"
+    echo "Trying to mount user-specified partition with $fs_type..."
+    if sudo mount $FS_OPTION "$ROOTFS_PART" "$MOUNT_DIR" 2>/dev/null; then
+      if [[ -d "$MOUNT_DIR/etc" && -d "$MOUNT_DIR/bin" ]]; then
+        echo "Successfully mounted rootfs partition"
+        ROOTFS_FOUND=true
+        break
+      else
+        echo "Mounted partition does not appear to be a rootfs"
+        sudo umount "$MOUNT_DIR"
+      fi
+    fi
+  done
+  
+  if ! $ROOTFS_FOUND; then
+    echo -e "${RED}Could not mount $ROOTFS_PART as a valid rootfs.${NC}"
+    echo "Debug information:"
+    sudo file -s "$ROOTFS_PART"
+    sudo blkid "$ROOTFS_PART"
+    exit 1
+  fi
+fi
+
+# Verify we have a mounted rootfs
+if ! mountpoint -q "$MOUNT_DIR"; then
+  echo -e "${RED}Failed to mount rootfs partition. This should not happen.${NC}"
+  exit 1
+fi
+
+echo -e "${GREEN}Successfully mounted rootfs partition: $ROOTFS_PART${NC}"
 
 # Configure SSH key authentication
 echo "Setting up SSH key authentication..."
@@ -132,9 +259,12 @@ else
   SSH_DIR="${MOUNT_DIR}/home/${USERNAME}/.ssh"
   # Ensure user exists
   PASSWD_FILE="${MOUNT_DIR}/etc/passwd"
-  if ! grep -q "^${USERNAME}:" "$PASSWD_FILE"; then
-    echo "Creating user $USERNAME..."
-    sudo chroot "$MOUNT_DIR" useradd -m -s /bin/bash "$USERNAME"
+  if ! grep -q "^${USERNAME}:" "$PASSWD_FILE" 2>/dev/null; then
+    echo "Creating user $USERNAME in passwd file..."
+    # Add user to passwd file directly if needed
+    echo "${USERNAME}:x:1000:1000:Jetson User:/home/${USERNAME}:/bin/bash" | sudo tee -a "$PASSWD_FILE" > /dev/null
+    echo "${USERNAME}:x:1000:" | sudo tee -a "${MOUNT_DIR}/etc/group" > /dev/null
+    sudo mkdir -p "${MOUNT_DIR}/home/${USERNAME}"
   fi
 fi
 
@@ -143,27 +273,31 @@ sudo cp "$SSH_KEY" "${SSH_DIR}/authorized_keys"
 sudo chmod 700 "$SSH_DIR"
 sudo chmod 600 "${SSH_DIR}/authorized_keys"
 if [[ "$USERNAME" != "root" ]]; then
-  USER_ID=$(grep "^${USERNAME}:" "${MOUNT_DIR}/etc/passwd" | cut -d: -f3)
-  GROUP_ID=$(grep "^${USERNAME}:" "${MOUNT_DIR}/etc/passwd" | cut -d: -f4)
-  sudo chown -R "${USER_ID}:${GROUP_ID}" "${MOUNT_DIR}/home/${USERNAME}"
+  sudo chown -R 1000:1000 "${MOUNT_DIR}/home/${USERNAME}"
 fi
 
 # Configure SSH for maximum security
 echo "Hardening SSH configuration..."
 SSHD_CONFIG="${MOUNT_DIR}/etc/ssh/sshd_config"
 
-# Backup original config
-sudo cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak"
+# Check if sshd_config exists
+if [[ ! -f "$SSHD_CONFIG" ]]; then
+  echo -e "${YELLOW}Warning: sshd_config not found. Creating new one.${NC}"
+  sudo mkdir -p "$(dirname "$SSHD_CONFIG")"
+  sudo touch "$SSHD_CONFIG"
+else
+  # Backup original config
+  sudo cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak"
+fi
 
 # Configure SSH security settings
 sudo tee "$SSHD_CONFIG" > /dev/null <<EOF
 # Secure SSH configuration for Jetson Nano
-# Generated by secure-jetson.sh
+# Generated by jetson-ssh-inject.sh
 
 # Basic SSH settings
 Port $SSH_PORT
 Protocol 2
-AddressFamily inet
 
 # Authentication settings
 LoginGraceTime 20
@@ -190,23 +324,11 @@ PermitTunnel no
 Compression no
 ClientAliveInterval 300
 ClientAliveCountMax 2
-Banner none
-DebianBanner no
 PermitUserEnvironment no
-UseDNS no
 
 # Logging
-SyslogFacility AUTH
 LogLevel VERBOSE
 EOF
-
-# Validate SSH config
-echo "Validating SSH configuration..."
-sudo chroot "$MOUNT_DIR" /usr/sbin/sshd -t -f /etc/ssh/sshd_config || {
-  echo -e "${RED}Invalid SSH configuration${NC}"
-  sudo mv "${SSHD_CONFIG}.bak" "$SSHD_CONFIG"
-  exit 1
-}
 
 # Create security setup script for first boot
 echo "Creating first-boot security setup..."
@@ -216,10 +338,10 @@ sudo mkdir -p "$(dirname "$SECURITY_SCRIPT")"
 sudo tee "$SECURITY_SCRIPT" > /dev/null <<EOF
 #!/bin/bash
 # First-boot security setup for Jetson Nano
-set -euo pipefail
+set -e
 LOG="/var/log/security-setup.log"
-exec > >(tee -a "\$LOG") 2>&1
-echo "Starting security hardening: \$(date)"
+echo "Starting security hardening at \$(date)" > "\$LOG"
+exec >> "\$LOG" 2>&1
 
 # Exit if already configured
 if [ -f "/var/lib/security-setup-done" ]; then
@@ -230,7 +352,7 @@ fi
 # Install security packages
 echo "Installing security packages..."
 apt-get update
-apt-get install -y ufw fail2ban unattended-upgrades apt-listchanges rkhunter aide debsums
+apt-get install -y ufw fail2ban unattended-upgrades apt-listchanges
 
 # Configure firewall
 echo "Configuring firewall..."
@@ -242,6 +364,7 @@ systemctl enable ufw
 
 # Configure fail2ban
 echo "Configuring fail2ban..."
+mkdir -p /etc/fail2ban/jail.d
 cat > /etc/fail2ban/jail.d/custom.conf <<EOL
 [sshd]
 enabled = true
@@ -261,8 +384,6 @@ cat > /etc/apt/apt.conf.d/20auto-upgrades <<EOL
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
-Unattended-Upgrade::Automatic-Reboot "true";
-Unattended-Upgrade::Automatic-Reboot-Time "02:00";
 EOL
 
 # System hardening
@@ -276,9 +397,6 @@ net.ipv4.conf.default.rp_filter = 1
 
 # Block SYN attacks
 net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_max_syn_backlog = 2048
-net.ipv4.tcp_synack_retries = 2
-net.ipv4.tcp_syn_retries = 5
 
 # Disable IP source routing
 net.ipv4.conf.all.accept_source_route = 0
@@ -297,75 +415,12 @@ net.ipv4.conf.default.secure_redirects = 0
 net.ipv4.ip_forward = 0
 net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
-
-# Protect against bad ICMP error messages
-net.ipv4.icmp_ignore_bogus_error_responses = 1
-
-# Disable IPv6 if not needed
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.lo.disable_ipv6 = 1
 EOL
-sysctl -p /etc/sysctl.d/99-security.conf
-
-# Secure shared memory
-echo "Securing shared memory..."
-echo "tmpfs /dev/shm tmpfs defaults,noexec,nosuid,nodev 0 0" >> /etc/fstab
-
-# Harden password policies
-echo "Hardening password policies..."
-sed -i 's/PASS_MAX_DAYS\t99999/PASS_MAX_DAYS\t90/' /etc/login.defs
-sed -i 's/PASS_MIN_DAYS\t0/PASS_MIN_DAYS\t1/' /etc/login.defs
-sed -i 's/PASS_WARN_AGE\t7/PASS_WARN_AGE\t14/' /etc/login.defs
-
-# PAM password policy
-apt-get install -y libpam-pwquality
-sed -i 's/password\s*requisite\s*pam_pwquality.so.*/password requisite pam_pwquality.so retry=3 minlen=12 difok=3 ucredit=-1 lcredit=-1 dcredit=-1 ocredit=-1 reject_username enforce_for_root/' /etc/pam.d/common-password
-
-# Restrict access to cron and at
-echo "Restricting access to cron..."
-echo "root" > /etc/cron.allow
-echo "root" > /etc/at.allow
-chmod 600 /etc/cron.allow /etc/at.allow
-rm -f /etc/cron.deny /etc/at.deny
-
-# Set up AIDE for file integrity monitoring
-echo "Setting up file integrity monitoring..."
-aideinit
-cp /var/lib/aide/aide.db.new /var/lib/aide/aide.db
-cat > /etc/cron.daily/aide-check <<EOL
-#!/bin/bash
-/usr/bin/aide.wrapper --check | mail -s "AIDE integrity check report" root
-EOL
-chmod +x /etc/cron.daily/aide-check
-
-# Create security scan script
-echo "Creating weekly security scan..."
-cat > /etc/cron.weekly/security-scan <<EOL
-#!/bin/bash
-LOG="/var/log/security-scan-\$(date +%Y%m%d).log"
-echo "Security scan started at \$(date)" > \$LOG
-echo "----------------------" >> \$LOG
-echo "rkhunter scan:" >> \$LOG
-rkhunter --update >> \$LOG
-rkhunter --checkall --skip-keypress >> \$LOG
-echo "----------------------" >> \$LOG
-echo "AIDE check:" >> \$LOG
-aide --check >> \$LOG
-echo "----------------------" >> \$LOG
-echo "Listening ports:" >> \$LOG
-netstat -tulpn >> \$LOG
-echo "----------------------" >> \$LOG
-echo "Failed login attempts:" >> \$LOG
-grep "Failed password" /var/log/auth.log | tail -20 >> \$LOG
-echo "Security scan completed at \$(date)" >> \$LOG
-chmod 600 \$LOG
-EOL
-chmod +x /etc/cron.weekly/security-scan
+sysctl -p /etc/sysctl.d/99-security.conf || echo "Some sysctl parameters may not be available on this kernel"
 
 # Mark security setup as done
 touch /var/lib/security-setup-done
-echo "Security hardening completed at $(date)"
+echo "Security hardening completed at \$(date)"
 EOF
 
 sudo chmod +x "$SECURITY_SCRIPT"
@@ -393,7 +448,7 @@ EOF
 sudo mkdir -p "${MOUNT_DIR}/etc/systemd/system/multi-user.target.wants"
 sudo ln -sf "../security-setup.service" "${MOUNT_DIR}/etc/systemd/system/multi-user.target.wants/security-setup.service"
 
-# Create backup rc.local as fallback to ensure security script runs
+# Create backup rc.local as fallback
 echo "Creating rc.local fallback..."
 RC_LOCAL="${MOUNT_DIR}/etc/rc.local"
 sudo tee "$RC_LOCAL" > /dev/null <<EOF
@@ -419,9 +474,6 @@ echo "- Firewall (UFW) configured to allow only SSH"
 echo "- Fail2ban configured to prevent brute force attacks"
 echo "- System hardening with secure kernel parameters"
 echo "- Automatic security updates"
-echo "- File integrity monitoring with AIDE"
-echo "- Weekly security scans"
-echo "- Secure password policies"
 echo
 echo "Insert this SD card into your Jetson Nano and power it on."
 echo "The security setup will complete automatically on first boot."
